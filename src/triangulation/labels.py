@@ -1,84 +1,57 @@
 """
-Binary label construction for the triangle gap closure classifier.
+Regression target construction for the triangle z-score forecasting model.
 
-Label definition:
-    y(t) = 1 if |residual[t+k]| ≤ 0.5 × |residual[t]| for any k ∈ [1, H]
-    y(t) = 0 otherwise
+Target definition:
+    z_future_H(t) = zscore(t + H)
 
-In plain English: did the triangle gap close at least 50% of its current size
-within the next H bars (wall-clock: 10 minutes at 10s resolution)?
+In plain English: what is the EWMA z-score of the triangle residual H bars from now?
 
-Important: labels are forward-looking by design. To prevent data leakage
-across train/val/test splits, apply a buffer of ≥ LABEL_10MIN_BARS bars at
-each split boundary before using these labels for training.
+A predicted z_future close to zero means the model expects the residual to mean-revert;
+a large |z_future| means the model expects the gap to persist or widen.
+
+The entry gate replaces P(closure) > 0.65 with:
+    |z_current - z_future_predicted| > move_threshold   (e.g. 1.0 z-score units)
+
+Important: targets are forward-looking by design. Apply a buffer of ≥ SPLIT_BUFFER_BARS bars
+at each split boundary before using these targets for training.
 """
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 
-from triangulation.features import LABEL_10MIN_BARS
+# ---------------------------------------------------------------------------
+# Horizon constants (wall-clock duration → bar count at 10s resolution)
+# ---------------------------------------------------------------------------
+HORIZON_30_BARS  =  30   #  5 min wall-clock =  30 × 10s bars
+HORIZON_60_BARS  =  60   # 10 min wall-clock =  60 × 10s bars  ← primary
+HORIZON_180_BARS = 180   # 30 min wall-clock = 180 × 10s bars
 
-# Buffer to apply at split boundaries — must be ≥ label horizon
-SPLIT_BUFFER_BARS = LABEL_10MIN_BARS  # 60 bars = 10 min wall-clock
-
-
-def compute_binary_label(
-    residual: pd.Series,
-    horizon_bars: int = LABEL_10MIN_BARS,
-) -> pd.Series:
-    """Compute the binary gap-closure label at each bar.
-
-    For each bar t: label = 1 if the residual's absolute value drops to ≤ 50%
-    of its value at t within the next `horizon_bars` bars.
-
-    Args:
-        residual:     Raw triangle residual at 10s resolution.
-        horizon_bars: Look-ahead window. Default 60 = 10 min wall-clock.
-
-    Returns:
-        Integer Series (0/1) named 'label'. The last `horizon_bars - 1` bars
-        will have a truncated look-ahead (fewer future bars available) but are
-        not NaN — they will have lower label quality near the series end.
-    """
-    abs_r = residual.abs()
-
-    # Forward rolling minimum over [t+1, ..., t+horizon_bars]:
-    #   1. Reverse the series.
-    #   2. Compute rolling min (window = horizon_bars).
-    #      At reversed position i this gives min over original positions
-    #      [n-1-i, ..., n-1-i-(horizon_bars-1)], i.e. the next horizon_bars
-    #      values going forward in time.
-    #   3. Reverse back and shift(-1) to exclude t itself and include t+H.
-    abs_fwd_min = (
-        abs_r.iloc[::-1]
-        .rolling(horizon_bars, min_periods=1)
-        .min()
-        .iloc[::-1]
-        .shift(-1)
-    )
-
-    label = (abs_fwd_min <= abs_r * 0.5).astype(int)
-    label.name = "label"
-    return label
+# Buffer to apply at split boundaries — must be ≥ longest horizon used for training
+SPLIT_BUFFER_BARS = HORIZON_60_BARS   # 60 bars = 10 min wall-clock
 
 
-def add_labels(
+def compute_future_zscore_targets(
     features: pd.DataFrame,
-    horizon_bars: int = LABEL_10MIN_BARS,
 ) -> pd.DataFrame:
-    """Attach the binary label column to a feature DataFrame in-place.
+    """Attach z_future_30, z_future_60, z_future_180 as regression targets.
+
+    Each column is the zscore shifted forward by the corresponding horizon.
+    The last HORIZON_180_BARS rows will be NaN for the longest target.
 
     Args:
-        features:     Feature DataFrame containing a 'residual' column.
-        horizon_bars: Label horizon in 10s bars.
+        features: Feature DataFrame containing a 'zscore' column.
 
     Returns:
-        Same DataFrame with a 'label' column appended.
+        Copy of features with three new columns appended:
+            z_future_30   — zscore 30 bars ahead  (5 min wall-clock)
+            z_future_60   — zscore 60 bars ahead  (10 min wall-clock)  ← primary
+            z_future_180  — zscore 180 bars ahead (30 min wall-clock)
     """
     features = features.copy()
-    features["label"] = compute_binary_label(features["residual"], horizon_bars)
+    features["z_future_30"]  = features["zscore"].shift(-HORIZON_30_BARS)
+    features["z_future_60"]  = features["zscore"].shift(-HORIZON_60_BARS)
+    features["z_future_180"] = features["zscore"].shift(-HORIZON_180_BARS)
     return features
 
 
@@ -88,14 +61,14 @@ def split_by_date(
     val_end: str,
     buffer_bars: int = SPLIT_BUFFER_BARS,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Chronological date-boundary split with label-leakage buffer.
+    """Chronological date-boundary split with forward-target leakage buffer.
 
     Args:
-        df:           Full feature+label DataFrame with DatetimeIndex.
+        df:           Full feature+target DataFrame with DatetimeIndex.
         train_end:    Inclusive end date for training, e.g. "2024-12-31".
         val_end:      Inclusive end date for validation, e.g. "2025-06-30".
         buffer_bars:  Number of bars to drop at each boundary to prevent
-                      forward-label leakage. Default = LABEL_10MIN_BARS (60).
+                      forward-target leakage. Default = SPLIT_BUFFER_BARS (60).
 
     Returns:
         (train, val, test) DataFrames. Buffer bars are dropped from the END
@@ -105,7 +78,7 @@ def split_by_date(
     val_mask   = (df.index >  train_end) & (df.index <= val_end)
     test_mask  = df.index >  val_end
 
-    train = df[train_mask].iloc[:-buffer_bars]   # drop last H bars
+    train = df[train_mask].iloc[:-buffer_bars]   # drop last buffer_bars
     val   = df[val_mask].iloc[:-buffer_bars]
     test  = df[test_mask]                         # test: no trailing buffer needed
 

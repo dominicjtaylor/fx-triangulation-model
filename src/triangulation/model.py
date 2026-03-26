@@ -1,11 +1,12 @@
 """
-LightGBM binary classifier + Platt calibration for the triangle gap closure model.
+LightGBM regression model for the triangle z-score forecasting pipeline.
 
-Mirrors the architecture of volare/model.py (vol forecasting pipeline) but
-adapted for binary classification. Key differences:
-  - LGBMClassifier (not Regressor), objective='binary', metric='auc'
-  - Platt scaling for probability calibration (LogisticRegression on raw scores)
-  - Date-boundary splits (not fraction-based) — see labels.split_by_date()
+Mirrors the architecture of volare/model.py (vol forecasting pipeline) closely:
+  - LGBMRegressor, objective='regression' (L2), eval_metric='rmse'
+  - Two-stage training: Stage 1 finds best_iteration_ on val; Stage 2 retrains
+    on combined train+val with fixed n_estimators = best_iteration_
+  - No Platt scaling (regression, not classification)
+  - Evaluate on RMSE, MAE, directional accuracy, simulated Sharpe
 
 Python 3.9 compatible: uses Optional[X] from typing, not X | Y union syntax.
 """
@@ -16,13 +17,8 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMClassifier, early_stopping, log_evaluation
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    roc_auc_score,
-    brier_score_loss,
-    precision_score,
-)
+from lightgbm import LGBMRegressor, early_stopping, log_evaluation, record_evaluation
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 
 # ---------------------------------------------------------------------------
@@ -34,15 +30,20 @@ DEFAULT_PARAMS: dict = {
     "learning_rate":     0.05,
     "num_leaves":        31,
     "min_child_samples": 20,
-    "objective":         "binary",
-    "metric":            "auc",
+    "feature_fraction":  0.9,
+    "bagging_fraction":  0.8,
+    "bagging_freq":      5,
+    "objective":         "regression",
+    "metric":            "rmse",
     "n_jobs":            -1,
     "verbose":           -1,
 }
 
-# Feature columns: everything except these targets/identifiers
-# Exclude raw prices and the target; keep residual and zscore as features
-_EXCLUDE_COLS = {"eurusd", "audusd", "euraud", "euraud_bid", "euraud_ask", "label"}
+# Feature columns: everything except regression targets and raw prices
+_EXCLUDE_COLS = {
+    "eurusd", "audusd", "euraud", "euraud_bid", "euraud_ask",
+    "z_future_30", "z_future_60", "z_future_180",
+}
 
 
 def get_feature_cols(df: pd.DataFrame) -> list[str]:
@@ -51,7 +52,7 @@ def get_feature_cols(df: pd.DataFrame) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Training
+# Training — two-stage (mirrors volare/model.py)
 # ---------------------------------------------------------------------------
 
 def train_model(
@@ -60,61 +61,56 @@ def train_model(
     X_val: np.ndarray,
     y_val: np.ndarray,
     params: Optional[dict] = None,
-) -> LGBMClassifier:
-    """Train LGBMClassifier with early stopping on validation AUC.
+) -> tuple[LGBMRegressor, dict]:
+    """Stage 1: train with early stopping on validation RMSE.
 
     Args:
-        X_train/y_train: Training features and binary labels.
-        X_val/y_val:     Validation features and binary labels (for early stopping).
+        X_train/y_train: Training features and continuous z-score targets.
+        X_val/y_val:     Validation features and targets (for early stopping).
         params:          Override DEFAULT_PARAMS (merged, not replaced).
 
     Returns:
-        Fitted LGBMClassifier.
+        (model, evals_result) — fitted LGBMRegressor and eval history dict.
+        model.best_iteration_ gives the optimal number of trees.
     """
     p = {**DEFAULT_PARAMS, **(params or {})}
-    model = LGBMClassifier(**p)
+    model = LGBMRegressor(**p)
+    evals_result: dict = {}
     model.fit(
         X_train, y_train,
         eval_set=[(X_val, y_val)],
         callbacks=[
             early_stopping(stopping_rounds=50, verbose=False),
             log_evaluation(period=-1),
+            record_evaluation(evals_result),
         ],
     )
-    return model
+    return model, evals_result
 
 
-# ---------------------------------------------------------------------------
-# Platt calibration
-# ---------------------------------------------------------------------------
+def retrain_model(
+    model: LGBMRegressor,
+    X_combined: np.ndarray,
+    y_combined: np.ndarray,
+) -> LGBMRegressor:
+    """Stage 2: refit on combined train+val with fixed n_estimators.
 
-def calibrate_model(
-    model: LGBMClassifier,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
-) -> LogisticRegression:
-    """Fit a Platt scaling calibrator on the validation set.
+    Uses model.best_iteration_ from Stage 1 as the fixed tree count,
+    so the final model has the same capacity but more training data.
 
-    Fits LogisticRegression(raw_scores → calibrated_probs) using the model's
-    predicted probabilities on the validation set as inputs.
+    Args:
+        model:      Stage-1 fitted model (provides best_iteration_ and hyperparams).
+        X_combined: Concatenated train+val features.
+        y_combined: Concatenated train+val targets.
 
     Returns:
-        Fitted LogisticRegression (single feature: raw P(closure)).
+        New fitted LGBMRegressor trained on combined data.
     """
-    raw_probs = model.predict_proba(X_val)[:, 1].reshape(-1, 1)
-    calibrator = LogisticRegression(C=1.0, solver="lbfgs", max_iter=1000)
-    calibrator.fit(raw_probs, y_val)
-    return calibrator
-
-
-def predict_proba_calibrated(
-    model: LGBMClassifier,
-    calibrator: LogisticRegression,
-    X: np.ndarray,
-) -> np.ndarray:
-    """Return calibrated P(closure) for feature matrix X."""
-    raw_probs = model.predict_proba(X)[:, 1].reshape(-1, 1)
-    return calibrator.predict_proba(raw_probs)[:, 1]
+    params = model.get_params()
+    params["n_estimators"] = model.best_iteration_
+    model_refit = LGBMRegressor(**params)
+    model_refit.fit(X_combined, y_combined)
+    return model_refit
 
 
 # ---------------------------------------------------------------------------
@@ -122,44 +118,109 @@ def predict_proba_calibrated(
 # ---------------------------------------------------------------------------
 
 def evaluate_model(
-    model: LGBMClassifier,
-    calibrator: LogisticRegression,
+    model: LGBMRegressor,
     X: np.ndarray,
     y: np.ndarray,
-    threshold: float = 0.65,
 ) -> dict:
-    """Evaluate the calibrated model on a held-out set.
+    """Evaluate model on a held-out set.
 
     Args:
-        model/calibrator: Trained model and Platt scaler.
-        X/y:              Feature matrix and true binary labels.
-        threshold:        Probability threshold for precision calculation.
+        model: Trained LGBMRegressor (Stage 2 refit or Stage 1).
+        X/y:   Feature matrix and true future z-score targets.
 
     Returns:
         Dict with keys:
-            auc_roc          — area under ROC curve
-            brier_score      — calibration quality (lower = better)
-            n_above_threshold — number of bars where P(closure) > threshold
-            precision_at_thr — precision among bars where P > threshold
-            mean_prob        — mean predicted probability
-            label_rate       — actual positive rate in y
+            rmse               — root mean squared error
+            mae                — mean absolute error
+            directional_accuracy — fraction where sign(pred) == sign(actual)
+                                   (trading-relevant: did we get direction right?)
+            mean_pred          — mean predicted z-score
+            mean_actual        — mean actual z-score (sanity check vs zero)
     """
-    probs = predict_proba_calibrated(model, calibrator, X)
-    above = probs >= threshold
+    y_pred = model.predict(X)
 
-    result = {
-        "auc_roc":           float(roc_auc_score(y, probs)),
-        "brier_score":       float(brier_score_loss(y, probs)),
-        "n_above_threshold": int(above.sum()),
-        "mean_prob":         float(probs.mean()),
-        "label_rate":        float(y.mean()),
-    }
-    if above.sum() > 0:
-        result["precision_at_thr"] = float(precision_score(y[above], (probs[above] >= threshold)))
+    rmse = float(np.sqrt(mean_squared_error(y, y_pred)))
+    mae  = float(mean_absolute_error(y, y_pred))
+
+    # Directional accuracy: exclude near-zero actuals to avoid noise dominating
+    nonzero_mask = np.abs(y) > 1e-6
+    if nonzero_mask.sum() > 0:
+        dir_acc = float(np.mean(np.sign(y_pred[nonzero_mask]) == np.sign(y[nonzero_mask])))
     else:
-        result["precision_at_thr"] = float("nan")
+        dir_acc = float("nan")
 
-    return result
+    return {
+        "rmse":                rmse,
+        "mae":                 mae,
+        "directional_accuracy": dir_acc,
+        "mean_pred":           float(y_pred.mean()),
+        "mean_actual":         float(y.mean()),
+    }
+
+
+def simulated_sharpe(
+    feat_df: pd.DataFrame,
+    model: LGBMRegressor,
+    feature_cols: list[str],
+    move_threshold: float = 1.0,
+    horizon_bars: int = 60,
+    bars_per_year: int = 2_628_000,  # 365.25 * 24 * 3600 / 10
+) -> dict:
+    """Compute simulated Sharpe on a feature+target DataFrame.
+
+    For each bar where |predicted_move| > move_threshold, enter trade at bar t,
+    exit at bar t + horizon_bars. P&L = direction × (zscore[t] - zscore[t + horizon_bars]).
+
+    Args:
+        feat_df:         DataFrame with feature columns and 'zscore' column.
+        model:           Trained LGBMRegressor.
+        feature_cols:    Ordered list of feature column names.
+        move_threshold:  Minimum |predicted_move| to trigger entry (z-score units).
+        horizon_bars:    Exit after this many bars.
+        bars_per_year:   Bars per year for annualisation (10s bars: 365.25d × 8640).
+
+    Returns:
+        Dict with keys:
+            n_trades        — number of signal bars
+            sharpe          — annualised Sharpe ratio
+            mean_pnl        — mean per-trade P&L (z-score units)
+            total_pnl       — sum of all trade P&Ls
+            hit_rate        — fraction of trades with positive P&L
+    """
+    X = feat_df[feature_cols].values
+    z_current = feat_df["zscore"].values
+
+    # Forward z-score (actual exit value)
+    z_exit = feat_df["zscore"].shift(-horizon_bars).values
+
+    y_pred = model.predict(X)
+    predicted_move = z_current - y_pred   # expected closure direction/magnitude
+
+    signal_mask = (np.abs(predicted_move) > move_threshold) & ~np.isnan(z_exit)
+    n_trades = int(signal_mask.sum())
+
+    if n_trades == 0:
+        return {
+            "n_trades": 0,
+            "sharpe": float("nan"),
+            "mean_pnl": float("nan"),
+            "total_pnl": float("nan"),
+            "hit_rate": float("nan"),
+        }
+
+    direction = np.sign(predicted_move[signal_mask])
+    pnl = direction * (z_current[signal_mask] - z_exit[signal_mask])
+
+    ann_factor = np.sqrt(bars_per_year / horizon_bars)
+    sharpe = float(pnl.mean() / (pnl.std() + 1e-10) * ann_factor)
+
+    return {
+        "n_trades":  n_trades,
+        "sharpe":    sharpe,
+        "mean_pnl":  float(pnl.mean()),
+        "total_pnl": float(pnl.sum()),
+        "hit_rate":  float((pnl > 0).mean()),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -177,12 +238,12 @@ def walk_forward_folds(
     """Generate expanding-window walk-forward folds within the training period.
 
     Args:
-        df:           Full feature+label DataFrame with DatetimeIndex.
+        df:           Full feature+target DataFrame with DatetimeIndex.
         train_start:  Start of the training window (inclusive).
         train_end:    End of the training window — folds are built within this range.
         fold_months:  Size of each incremental training chunk in months.
         oos_months:   Out-of-sample test window per fold in months.
-        buffer_bars:  Gap between fold train end and OOS start (label-leakage buffer).
+        buffer_bars:  Gap between fold train end and OOS start (target-leakage buffer).
 
     Returns:
         List of dicts, each with keys: fold, train_df, oos_df.
@@ -201,11 +262,10 @@ def walk_forward_folds(
         fold_oos_start = df.index[df.index >= cursor]
         if len(fold_oos_start) == 0:
             break
-        oos_start_idx = fold_oos_start[0]
         oos_end = cursor + relativedelta(months=oos_months)
         fold_oos = df[(df.index >= cursor) & (df.index < oos_end)]
 
-        # Apply label-leakage buffer: drop last `buffer_bars` from train end
+        # Apply target-leakage buffer: drop last `buffer_bars` from train end
         if len(fold_train) > buffer_bars and len(fold_oos) > 0:
             folds.append({
                 "fold":     fold_num,
