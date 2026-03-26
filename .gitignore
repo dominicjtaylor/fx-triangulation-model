@@ -1,0 +1,18 @@
+# Ignore all real candle data
+data/*.gmr
+
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# VS Code settings
+.vscode/
+
+# Mac system files
+.DS_Store%
