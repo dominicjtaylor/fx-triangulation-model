@@ -139,3 +139,32 @@ python3 scripts/run_backtest.py [--move-threshold 1.0]  # Week 3: simulate trade
 Each script saves outputs to `outputs/` and prints a gate summary on exit. `run_backtest.py` requires the model artefact produced by `run_training.py` (`outputs/models/lgbm_regression_h60.pkl`).
 
 Requires Python ≥ 3.9, `lightgbm`, `pandas`, `numpy`, `statsmodels`, `scipy`, `scikit-learn`, `matplotlib`.
+
+---
+
+## Planned: Three-Leg Execution
+
+The current implementation trades the EUR/AUD leg only (Approach A). This carries unintended directional exposure — the P&L depends not just on the residual converging but on EUR/USD and AUD/USD not moving against the position in the meantime.
+
+The natural extension is to trade all three legs simultaneously in proportions that net USD exposure to zero:
+
+```
+If residual z-score < -2.0 (EUR/AUD cheap vs implied):
+  BUY  EUR/AUD
+  SELL EUR/USD
+  BUY  AUD/USD
+
+If residual z-score > +2.0 (EUR/AUD expensive vs implied):
+  SELL EUR/AUD
+  BUY  EUR/USD
+  SELL AUD/USD
+```
+
+This converts the trade from a directional EUR/AUD bet into a pure spread trade on the residual. P&L is driven entirely by the triangle closing, regardless of where any individual pair moves. The predicted move from the regression model still drives entry and sizing — the only change is routing three orders instead of one.
+
+The entry threshold needs to be wider to absorb three spreads rather than one. At retail ECN execution costs (combined round-trip ~4–5 pips across three legs), the minimum viable gap is approximately 6–8 pips vs 5–7 pips for the single-leg version.
+
+**Prerequisites before implementing:**
+- Single-leg version validated through full simulated trading (Week 3 complete)
+- Execution venue confirmed to support simultaneous multi-leg order routing
+- Slippage estimates for all three legs measured from live paper trading, not assumed

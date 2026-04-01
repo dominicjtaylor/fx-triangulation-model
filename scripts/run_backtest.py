@@ -41,10 +41,11 @@ from triangulation.residual import build_signal_frame
 from triangulation.features import build_feature_frame
 from triangulation.labels import compute_future_zscore_targets
 from triangulation.plots import plot_equity_curve
+from triangulation.backtest import simulate, daily_sharpe
 
-DATA_DIR   = ROOT / "data"
-MODELS_DIR = ROOT / "outputs" / "models"
-PLOTS_DIR  = ROOT / "outputs" / "plots"
+DATA_DIR    = ROOT / "data"
+MODELS_DIR  = ROOT / "outputs" / "models"
+PLOTS_DIR   = ROOT / "outputs" / "plots"
 OUTPUTS_DIR = ROOT / "outputs"
 
 TRAIN_END = "2024-12-31"
@@ -53,33 +54,13 @@ VAL_END   = "2025-06-30"
 SPLIT_DATES = {"train_end": TRAIN_END, "val_end": VAL_END}
 
 # 30 days at 10s resolution = 30 × 24 × 3600 / 10 = 259,200 bars
-_BARS_30D  = 259_200
-# 30 minutes suppression = 30 × 60 / 10 = 180 bars
-_BARS_30M  = 180
+_BARS_30D = 259_200
 
 
 def divider(title: str) -> None:
     print(f"\n{'='*60}")
     print(f"  {title}")
     print("=" * 60)
-
-
-def _build_equity_series(
-    trade_log: pd.DataFrame,
-    index: pd.DatetimeIndex,
-) -> pd.Series:
-    """Map trade net_pips to their exit bar, then cumsum to get equity curve."""
-    pnl = pd.Series(0.0, index=index)
-    for _, row in trade_log.iterrows():
-        exit_ts = row["exit_time"]
-        if exit_ts in pnl.index:
-            pnl.loc[exit_ts] += row["net_pips"]
-        else:
-            # Snap to nearest available bar
-            pos = pnl.index.searchsorted(exit_ts)
-            if pos < len(pnl):
-                pnl.iloc[pos] += row["net_pips"]
-    return pnl.cumsum()
 
 
 def main() -> None:
@@ -148,118 +129,20 @@ def main() -> None:
     print(f"Test set: {len(test_df):,} bars  ({test_df.index[0].date()} → {test_df.index[-1].date()})")
 
     # -----------------------------------------------------------------------
-    # 5. Batch model inference
-    # -----------------------------------------------------------------------
-    divider("Running batch inference on test set")
-    X_test         = test_df[feature_cols].values
-    z_current      = test_df["zscore"].values
-    euraud_prices  = test_df["euraud"].values    # EUR/AUD spot price for P&L in pips
-    vol_spike      = test_df["vol_spike"].values.astype(bool)
-    timestamps     = test_df.index
-
-    y_pred          = model.predict(X_test)
-    predicted_moves = z_current - y_pred
-
-    # Signal candidates:
-    #   1. |predicted_move| > threshold (model sees a large expected z-score change)
-    #   2. |z_current| >= entry_z_min (gap is large enough that the reversal stop won't fire trivially)
-    #   3. sign(z_current) == sign(predicted_move) — mean-reversion only:
-    #      - z > 0 and predicted_move > 0: model expects z to fall → SHORT EUR/AUD ✓
-    #      - z < 0 and predicted_move < 0: model expects z to rise → LONG  EUR/AUD ✓
-    #      Filters out cases where the model predicts z widening (momentum), which would
-    #      create a direction inconsistent with the mean-reversion rationale.
-    #   4. Not a vol-spike bar
-    signal_mask = (
-        (np.abs(predicted_moves) > args.move_threshold) &
-        (np.abs(z_current) >= args.entry_z_min) &
-        (np.sign(z_current) == np.sign(predicted_moves)) &
-        (~vol_spike)
-    )
-    signal_indices = np.where(signal_mask)[0]
-    print(f"Signal candidates: {len(signal_indices):,}  ({len(signal_indices)/len(test_df)*100:.1f}% of bars)")
-
-    # -----------------------------------------------------------------------
-    # 6. Simulation loop
+    # 5. Run simulation
     # -----------------------------------------------------------------------
     divider("Running simulation (one position at a time)")
-    trades       = []
-    next_free    = 0   # first bar index we can enter a new trade
-
-    for sig_i in signal_indices:
-        if sig_i < next_free:
-            continue
-
-        # Entry
-        entry_i      = sig_i
-        entry_z      = float(z_current[entry_i])
-        entry_euraud = float(euraud_prices[entry_i])
-        pm           = float(predicted_moves[entry_i])
-        direction    = float(np.sign(entry_z))   # sign(z) = trade direction: +1 = SHORT, -1 = LONG
-        pos_size     = args.base_size * abs(pm) * args.kelly
-
-        # Vectorised exit detection over next `horizon` bars
-        end_i       = min(entry_i + args.horizon, len(z_current) - 1)
-        future_z    = z_current[entry_i + 1 : end_i + 1]
-        future_vs   = vol_spike[entry_i + 1 : end_i + 1]
-        future_len  = len(future_z)
-
-        # Exit condition 1: vol spike
-        vs_hits = np.where(future_vs)[0]
-        vs_off  = int(vs_hits[0]) if len(vs_hits) > 0 else future_len
-
-        # Exit condition 2: z reversal (|z| grew to > 1.5× |entry_z|, same sign = gap widened)
-        rev_hits = np.where(
-            (np.abs(future_z) > 1.5 * abs(entry_z)) &
-            (np.sign(future_z) == np.sign(entry_z))
-        )[0]
-        rev_off = int(rev_hits[0]) if len(rev_hits) > 0 else future_len
-
-        # Exit condition 3: time-based (last bar of horizon)
-        time_off = future_len - 1
-
-        # First exit wins
-        exit_off    = min(vs_off, rev_off, time_off)
-        if vs_off <= rev_off and vs_off < future_len:
-            exit_reason = "vol_spike"
-        elif rev_off < vs_off and rev_off < future_len:
-            exit_reason = "reversal"
-        else:
-            exit_reason = "time"
-
-        exit_i       = entry_i + 1 + exit_off
-        exit_z       = float(z_current[exit_i])
-        exit_euraud  = float(euraud_prices[exit_i])
-
-        # P&L in EUR/AUD pips (Approach A: trade EUR/AUD leg only).
-        # direction=+1 (SHORT): profit when EUR/AUD price falls (entry > exit).
-        # direction=-1 (LONG):  profit when EUR/AUD price rises (exit > entry).
-        # gross_pips = direction × (entry_euraud − exit_euraud) × 10000
-        gross_pips = direction * (entry_euraud - exit_euraud) * 10_000
-        net_pips   = gross_pips - args.costs_pips
-        bars_held  = exit_i - entry_i
-
-        trades.append({
-            "entry_time":    timestamps[entry_i],
-            "entry_z":       entry_z,
-            "entry_euraud":  entry_euraud,
-            "predicted_move": pm,
-            "position_size":  pos_size,
-            "exit_time":      timestamps[exit_i],
-            "exit_z":         exit_z,
-            "exit_euraud":   exit_euraud,
-            "exit_reason":    exit_reason,
-            "gross_pips":     gross_pips,
-            "net_pips":       net_pips,
-            "bars_held":      bars_held,
-        })
-
-        # Advance free cursor; vol spike adds 30-min suppression
-        if exit_reason == "vol_spike":
-            next_free = exit_i + 1 + _BARS_30M
-        else:
-            next_free = exit_i + 1
-
-    trade_log = pd.DataFrame(trades)
+    trade_log, equity = simulate(
+        test_df,
+        model,
+        feature_cols,
+        move_threshold=args.move_threshold,
+        entry_z_min=args.entry_z_min,
+        horizon=args.horizon,
+        kelly=args.kelly,
+        base_size=args.base_size,
+        costs_pips=args.costs_pips,
+    )
     print(f"Trades executed: {len(trade_log):,}")
 
     if len(trade_log) == 0:
@@ -267,25 +150,16 @@ def main() -> None:
         sys.exit(0)
 
     # -----------------------------------------------------------------------
-    # 7. Performance metrics
+    # 6. Performance metrics
     # -----------------------------------------------------------------------
     divider("Performance metrics")
-    net_pips_arr = trade_log["net_pips"].values
-    total_net    = float(net_pips_arr.sum())
-    win_rate     = float((net_pips_arr > 0).mean())
+    net_pips_arr  = trade_log["net_pips"].values
+    total_net     = float(net_pips_arr.sum())
+    win_rate      = float((net_pips_arr > 0).mean())
     avg_hold_bars = float(trade_log["bars_held"].mean())
     avg_hold_min  = avg_hold_bars * 10 / 60
 
-    # Annualised Sharpe on daily P&L
-    equity = _build_equity_series(trade_log, test_df.index)
-    pnl_at_exit = pd.Series(0.0, index=test_df.index)
-    for _, row in trade_log.iterrows():
-        ts = row["exit_time"]
-        if ts in pnl_at_exit.index:
-            pnl_at_exit.loc[ts] += row["net_pips"]
-    daily_pnl   = pnl_at_exit.resample("1D").sum()
-    daily_pnl   = daily_pnl[daily_pnl != 0]
-    sharpe      = float(daily_pnl.mean() / (daily_pnl.std() + 1e-10) * np.sqrt(252))
+    sharpe = daily_sharpe(trade_log, test_df.index)
 
     # Drawdown
     running_max  = equity.cummax()
@@ -293,11 +167,11 @@ def main() -> None:
     max_drawdown = float(drawdown.min())
 
     # Trades per week
-    test_days    = (test_df.index[-1] - test_df.index[0]).days
+    test_days       = (test_df.index[-1] - test_df.index[0]).days
     trades_per_week = len(trade_log) / max(test_days / 7, 1)
 
     # Exit breakdown
-    exit_counts  = trade_log["exit_reason"].value_counts(normalize=True).to_dict()
+    exit_counts = trade_log["exit_reason"].value_counts(normalize=True).to_dict()
 
     print(f"  Total net P&L:     {total_net:+.1f} pips")
     print(f"  Win rate:          {win_rate:.1%}")
@@ -309,7 +183,7 @@ def main() -> None:
           + "  ".join(f"{k}: {v:.0%}" for k, v in exit_counts.items()))
 
     # -----------------------------------------------------------------------
-    # 8. Liberation Day assertion
+    # 7. Liberation Day assertion
     # -----------------------------------------------------------------------
     divider("Liberation Day gate (2025-04-02 → 2025-04-09)")
     ld_start = date(2025, 4, 2)
@@ -318,28 +192,28 @@ def main() -> None:
         (pd.to_datetime(trade_log["entry_time"]).dt.date >= ld_start) &
         (pd.to_datetime(trade_log["entry_time"]).dt.date <= ld_end)
     ]
-    n_ld = len(ld_trades)
+    n_ld  = len(ld_trades)
     ld_pass = n_ld == 0
     print(f"  Liberation Day trades: {n_ld}")
     print(f"  Gate: {'✓ PASS' if ld_pass else f'✗ FAIL ({n_ld} trades entered during structural repricing)'}")
 
     # -----------------------------------------------------------------------
-    # 9. Save trade log
+    # 8. Save trade log
     # -----------------------------------------------------------------------
     trade_log_path = OUTPUTS_DIR / "trade_log_test.csv"
     trade_log.to_csv(trade_log_path, index=False)
     print(f"\nTrade log saved → {trade_log_path}  ({len(trade_log):,} rows)")
 
     # -----------------------------------------------------------------------
-    # 10. Equity curve plot
+    # 9. Equity curve plot
     # -----------------------------------------------------------------------
     divider("Generating equity curve plot")
     stats_dict = {
-        "sharpe":         sharpe,
-        "max_drawdown":   max_drawdown,
-        "win_rate":       win_rate,
+        "sharpe":          sharpe,
+        "max_drawdown":    max_drawdown,
+        "win_rate":        win_rate,
         "trades_per_week": trades_per_week,
-        "exit_breakdown": exit_counts,
+        "exit_breakdown":  exit_counts,
     }
     fig = plot_equity_curve(
         equity,
@@ -352,7 +226,7 @@ def main() -> None:
     print(f"Plot saved → {PLOTS_DIR}/equity_curve.png")
 
     # -----------------------------------------------------------------------
-    # 11. Final summary
+    # 10. Final summary
     # -----------------------------------------------------------------------
     divider("Test set performance (2025-07-01 → 2026-03-01)")
     print(f"  Annualised Sharpe:      {sharpe:.2f}")
