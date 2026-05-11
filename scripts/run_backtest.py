@@ -4,10 +4,11 @@ Simulated trading backtest — EUR/USD/AUD Triangle (Week 3)
 Loads the saved model artefact from outputs/models/ and runs a deterministic
 simulation on the test set (2025-07-01 → 2026-03-17).
 
-Three deterministic exit conditions (checked in priority order):
-  1. Vol-spike gate:     1-min RV > 2.5× 30-day rolling avg → exit + suppress 30 min
-  2. Z-score reversal:  |z| grows to 1.5× |entry_z| (gap widened) → exit
-  3. Time-based:        exit after `horizon` bars regardless
+Four deterministic exit conditions (checked in priority order):
+  1. Vol-spike gate:       1-min RV > 2.5× 30-day rolling avg → exit + suppress 30 min
+  2. Profit target:        gross P&L ≥ profit_target_pips after min_hold_bars → exit (next bar)
+  3. Z-score reversal:     |z| grows to 1.5× |entry_z| (gap widened) → exit
+  4. Time-based backstop:  exit after `horizon` bars regardless
 
 Entry: |predicted_move| > move_threshold, no open position, not suppressed.
 Costs: 1.2 pips round-trip deducted per trade.
@@ -56,11 +57,36 @@ SPLIT_DATES = {"train_end": TRAIN_END, "val_end": VAL_END}
 # 30 days at 10s resolution = 30 × 24 × 3600 / 10 = 259,200 bars
 _BARS_30D = 259_200
 
+# Profit target sweep: (label, profit_target_pips, min_hold_bars)
+# Original has no profit target; the three new scenarios use 18-bar (3-min) min hold.
+_MIN_HOLD = 18   # bars = 3 minutes at 10s resolution (≈ OU half-life)
+_SCENARIOS = [
+    ("Original",  0.0, 0),
+    ("T=1.5 pips", 1.5, _MIN_HOLD),
+    ("T=2.0 pips", 2.0, _MIN_HOLD),
+    ("T=2.5 pips", 2.5, _MIN_HOLD),
+]
+
 
 def divider(title: str) -> None:
     print(f"\n{'='*60}")
     print(f"  {title}")
     print("=" * 60)
+
+
+def _metrics(tl: pd.DataFrame, eq: pd.Series, index: pd.DatetimeIndex, days: float) -> dict:
+    arr = tl["net_pips"].values
+    running_max = eq.cummax()
+    return {
+        "total_net":    float(arr.sum()),
+        "win_rate":     float((arr > 0).mean()),
+        "avg_hold_min": float(tl["bars_held"].mean()) * 10 / 60,
+        "trades":       len(tl),
+        "tpw":          len(tl) / max(days / 7, 1),
+        "sharpe":       daily_sharpe(tl, index),
+        "max_dd":       float((eq - running_max).min()),
+        "exits":        tl["exit_reason"].value_counts(normalize=True).to_dict(),
+    }
 
 
 def main() -> None:
@@ -129,13 +155,9 @@ def main() -> None:
     print(f"Test set: {len(test_df):,} bars  ({test_df.index[0].date()} → {test_df.index[-1].date()})")
 
     # -----------------------------------------------------------------------
-    # 5. Run simulation
+    # 5. Run all frac_target scenarios
     # -----------------------------------------------------------------------
-    divider("Running simulation (one position at a time)")
-    trade_log, equity = simulate(
-        test_df,
-        model,
-        feature_cols,
+    sim_kwargs = dict(
         move_threshold=args.move_threshold,
         entry_z_min=args.entry_z_min,
         horizon=args.horizon,
@@ -143,49 +165,83 @@ def main() -> None:
         base_size=args.base_size,
         costs_pips=args.costs_pips,
     )
-    print(f"Trades executed: {len(trade_log):,}")
 
-    if len(trade_log) == 0:
-        print("No trades — check move_threshold or data range.")
-        sys.exit(0)
-
-    # -----------------------------------------------------------------------
-    # 6. Performance metrics
-    # -----------------------------------------------------------------------
-    divider("Performance metrics")
-    net_pips_arr  = trade_log["net_pips"].values
-    total_net     = float(net_pips_arr.sum())
-    win_rate      = float((net_pips_arr > 0).mean())
-    avg_hold_bars = float(trade_log["bars_held"].mean())
-    avg_hold_min  = avg_hold_bars * 10 / 60
-
-    sharpe = daily_sharpe(trade_log, test_df.index)
-
-    # Drawdown
-    running_max  = equity.cummax()
-    drawdown     = equity - running_max
-    max_drawdown = float(drawdown.min())
-
-    # Trades per week
-    test_days       = (test_df.index[-1] - test_df.index[0]).days
-    trades_per_week = len(trade_log) / max(test_days / 7, 1)
-
-    # Exit breakdown
-    exit_counts = trade_log["exit_reason"].value_counts(normalize=True).to_dict()
-
-    print(f"  Total net P&L:     {total_net:+.1f} pips")
-    print(f"  Win rate:          {win_rate:.1%}")
-    print(f"  Avg hold:          {avg_hold_min:.1f} min ({avg_hold_bars:.1f} bars)")
-    print(f"  Trades/week:       {trades_per_week:.1f}")
-    print(f"  Daily Sharpe:      {sharpe:.3f}")
-    print(f"  Max drawdown:      {max_drawdown:.1f} pips")
-    print(f"  Exit reasons:      "
-          + "  ".join(f"{k}: {v:.0%}" for k, v in exit_counts.items()))
+    results: dict[str, tuple] = {}
+    for label, pt_pips, mh_bars in _SCENARIOS:
+        divider(f"Running simulation — {label}")
+        tl, eq = simulate(
+            test_df, model, feature_cols,
+            profit_target_pips=pt_pips,
+            min_hold_bars=mh_bars,
+            **sim_kwargs,
+        )
+        results[label] = (tl, eq)
+        print(f"  Trades executed: {len(tl):,}")
 
     # -----------------------------------------------------------------------
-    # 7. Liberation Day assertion
+    # 6. Compute metrics for all scenarios
     # -----------------------------------------------------------------------
-    divider("Liberation Day gate (2025-04-02 → 2025-04-09)")
+    test_days = (test_df.index[-1] - test_df.index[0]).days
+    all_metrics: dict[str, dict] = {}
+    for label, (tl, eq) in results.items():
+        all_metrics[label] = _metrics(tl, eq, test_df.index, test_days)
+
+    # -----------------------------------------------------------------------
+    # 7. Comparison table
+    # -----------------------------------------------------------------------
+    divider("Comparison: Original vs Profit Target exits (18-bar min hold)")
+
+    labels = list(all_metrics.keys())
+    col_w  = 22
+    col_v  = 13
+
+    header = f"  {'Metric':<{col_w}}" + "".join(f"  {lb:>{col_v}}" for lb in labels)
+    print(header)
+    print(f"  {'-'*col_w}" + "".join(f"  {'-'*col_v}" for _ in labels))
+
+    def row(label_str: str, vals: list, fmt: str = ".1f", pct: bool = False) -> None:
+        suffix = "%" if pct else ""
+        cells = "".join(f"  {v:{fmt}}{suffix:>{col_v - len(f'{v:{fmt}}') - len(suffix)}}" for v in vals)
+        # simpler: just format each cell
+        parts = [f"{v:{fmt}}{suffix}" for v in vals]
+        line = f"  {label_str:<{col_w}}" + "".join(f"  {p:>{col_v}}" for p in parts)
+        print(line)
+
+    row("Total net P&L (pips)", [all_metrics[lb]["total_net"]     for lb in labels])
+    row("Win rate",             [all_metrics[lb]["win_rate"]*100  for lb in labels], pct=True)
+    row("Avg hold (min)",       [all_metrics[lb]["avg_hold_min"]  for lb in labels])
+    row("Trades executed",      [all_metrics[lb]["trades"]        for lb in labels], fmt=".0f")
+    row("Trades/week",          [all_metrics[lb]["tpw"]           for lb in labels])
+    row("Daily Sharpe",         [all_metrics[lb]["sharpe"]        for lb in labels], fmt=".3f")
+    row("Max drawdown (pips)",  [all_metrics[lb]["max_dd"]        for lb in labels])
+
+    print()
+    for lb in labels:
+        exits = all_metrics[lb]["exits"]
+        exits_str = "  ".join(f"{k} {v:.0%}" for k, v in exits.items())
+        print(f"  Exits [{lb}]: {exits_str}")
+
+    # -----------------------------------------------------------------------
+    # 8. Pick best scenario for downstream outputs (lowest max_dd among +ve trades)
+    # -----------------------------------------------------------------------
+    # Use the scenario with frac_target=0.75 as the "primary" saved result,
+    # since that is the user-specified default. Fall back to Original if missing.
+    primary_label = "T=2.0 pips" if "T=2.0 pips" in results else "Original"
+    trade_log, equity = results[primary_label]
+    m_primary = all_metrics[primary_label]
+
+    win_rate      = m_primary["win_rate"]
+    total_net     = m_primary["total_net"]
+    avg_hold_min  = m_primary["avg_hold_min"]
+    trades_per_week = m_primary["tpw"]
+    sharpe        = m_primary["sharpe"]
+    max_drawdown  = m_primary["max_dd"]
+    exit_counts   = m_primary["exits"]
+
+    # -----------------------------------------------------------------------
+    # 9. Liberation Day assertion (on primary scenario)
+    # -----------------------------------------------------------------------
+    divider(f"Liberation Day gate (2025-04-02 → 2025-04-09)  [{primary_label}]")
     ld_start = date(2025, 4, 2)
     ld_end   = date(2025, 4, 9)
     ld_trades = trade_log[
@@ -198,16 +254,16 @@ def main() -> None:
     print(f"  Gate: {'✓ PASS' if ld_pass else f'✗ FAIL ({n_ld} trades entered during structural repricing)'}")
 
     # -----------------------------------------------------------------------
-    # 8. Save trade log
+    # 10. Save primary trade log
     # -----------------------------------------------------------------------
     trade_log_path = OUTPUTS_DIR / "trade_log_test.csv"
     trade_log.to_csv(trade_log_path, index=False)
-    print(f"\nTrade log saved → {trade_log_path}  ({len(trade_log):,} rows)")
+    print(f"\nTrade log saved → {trade_log_path}  ({len(trade_log):,} rows)  [{primary_label}]")
 
     # -----------------------------------------------------------------------
-    # 9. Equity curve plot
+    # 11. Equity curve plot (primary scenario)
     # -----------------------------------------------------------------------
-    divider("Generating equity curve plot")
+    divider(f"Generating equity curve plot  [{primary_label}]")
     stats_dict = {
         "sharpe":          sharpe,
         "max_drawdown":    max_drawdown,
@@ -226,9 +282,9 @@ def main() -> None:
     print(f"Plot saved → {PLOTS_DIR}/equity_curve.png")
 
     # -----------------------------------------------------------------------
-    # 10. Final summary
+    # 12. Final summary (primary scenario)
     # -----------------------------------------------------------------------
-    divider("Test set performance (2025-07-01 → 2026-03-01)")
+    divider(f"Test set performance — {primary_label}  (2025-07-01 → 2026-03-01)")
     print(f"  Annualised Sharpe:      {sharpe:.2f}")
     print(f"  Max drawdown (pips):    {max_drawdown:.1f}")
     print(f"  Win rate:               {win_rate:.1%}")

@@ -73,25 +73,37 @@ def simulate(
     base_size: float = 100_000.0,
     costs_pips: float = 1.2,
     delay: int = 0,
+    min_hold_bars: int = 0,
+    profit_target_pips: float = 0.0,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Run the deterministic simulation loop on a prepared test DataFrame.
 
     Args:
-        test_df:         Test set DataFrame. Must contain feature columns plus
-                         'zscore', 'euraud', and 'vol_spike' columns.
-        model:           Fitted LGBMRegressor.
-        feature_cols:    Ordered list of feature column names.
-        move_threshold:  Minimum |predicted_move| to enter a trade.
-        entry_z_min:     Minimum |z_current| at entry. Prevents entering when
-                         the 1.5× reversal stop would fire at trivially small z.
-        horizon:         Maximum bars to hold before time-based exit.
-        kelly:           Kelly fraction for position sizing.
-        base_size:       Base position size in units.
-        costs_pips:      Round-trip execution cost per trade in pips.
-        delay:           Execution delay in bars. Signal fires at sig_i; order
-                         executes at sig_i + delay using the price at that bar.
-                         Direction is locked in at sig_i (the original signal).
-                         Default 0 = no delay (original behaviour).
+        test_df:             Test set DataFrame. Must contain feature columns
+                             plus 'zscore', 'euraud', and 'vol_spike' columns.
+        model:               Fitted LGBMRegressor.
+        feature_cols:        Ordered list of feature column names.
+        move_threshold:      Minimum |predicted_move| to enter a trade.
+        entry_z_min:         Minimum |z_current| at entry. Prevents entering
+                             when the 1.5× reversal stop would fire at trivially
+                             small z.
+        horizon:             Maximum bars to hold before time-based exit.
+        kelly:               Kelly fraction for position sizing.
+        base_size:           Base position size in units.
+        costs_pips:          Round-trip execution cost per trade in pips.
+        delay:               Execution delay in bars. Signal fires at sig_i;
+                             order executes at sig_i + delay using the price at
+                             that bar. Direction is locked in at sig_i.
+                             Default 0 = no delay (original behaviour).
+        min_hold_bars:       Minimum bars to hold before any profit-target exit
+                             can fire. Lets the noise period (sub-OU-half-life)
+                             pass before checking for a signal exit.
+                             Default 0 = no minimum hold.
+        profit_target_pips:  Gross pip profit target. When > 0, exit on the bar
+                             AFTER gross P&L first reaches this level, but only
+                             after min_hold_bars have elapsed. The time-based
+                             exit (horizon) acts as a hard backstop.
+                             When 0.0 (default), no signal exit — time is primary.
 
     Returns:
         trade_log:  DataFrame with one row per trade (columns: entry_time,
@@ -152,10 +164,11 @@ def simulate(
         pos_size     = base_size * abs(pm) * kelly
 
         # Vectorised exit detection over next `horizon` bars
-        end_i      = min(entry_i + horizon, len(z_current) - 1)
-        future_z   = z_current[entry_i + 1 : end_i + 1]
-        future_vs  = vol_spike[entry_i + 1 : end_i + 1]
-        future_len = len(future_z)
+        end_i         = min(entry_i + horizon, len(z_current) - 1)
+        future_z      = z_current[entry_i + 1 : end_i + 1]
+        future_vs     = vol_spike[entry_i + 1 : end_i + 1]
+        future_euraud = euraud_prices[entry_i + 1 : end_i + 1]
+        future_len    = len(future_z)
 
         # Exit condition 1: vol spike
         vs_hits = np.where(future_vs)[0]
@@ -168,14 +181,34 @@ def simulate(
         )[0]
         rev_off = int(rev_hits[0]) if len(rev_hits) > 0 else future_len
 
-        # Exit condition 3: time-based
+        # Exit condition 3: price-based profit target with minimum hold
+        # Only fires after min_hold_bars have elapsed (lets sub-OU-half-life
+        # noise pass). Detected at bar T; exit executes at bar T+1 to avoid
+        # look-ahead bias (we can only act after observing bar T's close).
+        if profit_target_pips > 0.0:
+            gross_at_bar = direction * (entry_euraud - future_euraud) * 10_000
+            pt_cond = np.zeros(future_len, dtype=bool)
+            if min_hold_bars < future_len:
+                pt_cond[min_hold_bars:] = gross_at_bar[min_hold_bars:] >= profit_target_pips
+            pt_hits = np.where(pt_cond)[0]
+            if len(pt_hits) > 0:
+                next_bar = int(pt_hits[0]) + 1
+                pt_off = next_bar if next_bar < future_len else future_len
+            else:
+                pt_off = future_len
+        else:
+            pt_off = future_len
+
+        # Exit condition 4: time-based backstop
         time_off = future_len - 1
 
-        # First exit wins
-        exit_off = min(vs_off, rev_off, time_off)
-        if vs_off <= rev_off and vs_off < future_len:
+        # First exit wins; priority: vol_spike > profit_target > reversal > time
+        exit_off = min(vs_off, pt_off, rev_off, time_off)
+        if exit_off == vs_off and vs_off < future_len:
             exit_reason = "vol_spike"
-        elif rev_off < vs_off and rev_off < future_len:
+        elif exit_off == pt_off and pt_off < future_len:
+            exit_reason = "profit_target"
+        elif exit_off == rev_off and rev_off < future_len:
             exit_reason = "reversal"
         else:
             exit_reason = "time"
