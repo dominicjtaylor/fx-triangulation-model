@@ -71,9 +71,11 @@ Directional accuracy above 55% beats the pure-persistence baseline. The 4-hour E
 
 ---
 
-## Planned: Three-Leg Execution
+## Three-Leg Execution
 
-The current implementation trades the EUR/AUD leg only (Approach A). This carries unintended directional exposure — the P&L depends not just on the residual converging but on EUR/USD and AUD/USD not moving against the position in the meantime.
+**Status: implemented, not yet run against real data.** `simulate_3leg()` in `src/triangulation/backtest.py` and `scripts/run_backtest_3leg.py` route the three legs described below using the same trained model and entry/exit logic as the single-leg backtest — only execution and P&L differ. The P&L formula (see docstring) was validated against an explicit leg-by-leg cash-flow ledger and a manufactured triangulation-lag event in `scripts/validate_3leg_pnl.py` (`python3 scripts/validate_3leg_pnl.py`), since the raw `.gmr` price data isn't available in every environment this repo is checked out in. Run `scripts/run_backtest_3leg.py` on a machine with `data/*.gmr` present to get real Sharpe/cost numbers — it prints a direct comparison against `outputs/trade_log_test.csv` (the single-leg result) when that file exists.
+
+The single-leg implementation below (Approach A) trades the EUR/AUD leg only. This carries unintended directional exposure — the P&L depends not just on the residual converging but on EUR/USD and AUD/USD not moving against the position in the meantime.
 
 The natural extension is to trade all three legs simultaneously in proportions that net USD exposure to zero:
 
@@ -93,7 +95,8 @@ This converts the trade from a directional EUR/AUD bet into a pure spread trade 
 
 The entry threshold needs to be wider to absorb three spreads rather than one. At retail ECN execution costs (combined round-trip ~4–5 pips across three legs), the minimum viable gap is approximately 6–8 pips vs 5–7 pips for the single-leg version.
 
-**Prerequisites before implementing:**
-- Single-leg version validated through full simulated trading (Week 3 complete)
+**Prerequisites before live deployment:**
+- Single-leg version validated through full simulated trading (Week 3 complete) ✓
+- Backtest run against real historical data and compared to the single-leg result (code complete — pending a run with `data/*.gmr` present)
 - Execution venue confirmed to support simultaneous multi-leg order routing
 - Slippage estimates for all three legs measured from live paper trading, not assumed
